@@ -4,3 +4,5 @@ TTS
 python-dotenv
 aiohttp
 PyNaCl
+google-generativeai
+transformers==4.33.0
