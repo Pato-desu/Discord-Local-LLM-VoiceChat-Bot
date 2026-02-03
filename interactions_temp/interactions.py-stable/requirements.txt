@@ -1,0 +1,7 @@
+aiohttp
+attrs>=22.1
+audioop-lts; python_version>='3.13'
+croniter
+discord-typings>=0.9.0
+emoji
+tomli

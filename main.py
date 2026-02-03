@@ -1,10 +1,17 @@
 import os
-import json
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import re
 from pathlib import Path
+from datetime import datetime
+import struct
+
+# Add current directory to PATH for ffmpeg
+os.environ["PATH"] += os.pathsep + os.getcwd()
+# Bypass Coqui TTS license prompt
+os.environ["COQUI_TOS_AGREED"] = "1"
+
 import interactions
 from interactions import (
     Client,
@@ -16,180 +23,232 @@ from interactions import (
     Intents,
     Button,
     ButtonStyle,
-    ComponentContext,
     ActionRow,
     Embed,
 )
-from interactions.api.events import Startup
+from interactions.api.events import Ready
 from interactions.api.voice.audio import AudioVolume
+
+# Global flag to capture only one packet
+packet_captured = False
+
+# ── Monkey-patch for AEAD encryption support ──────────────────────────────────
+def patch_interactions_voice():
+    """
+    Patches interactions.py to support aead_xchacha20_poly1305_rtpsize.
+    Includes packet capture for debugging.
+    """
+    try:
+        from interactions.api.voice.encryption import Encryption, Decryption, Crypt
+        import nacl.bindings
+        
+        # 1. Patch Crypt.__init__ to store the secret key
+        _original_init = Crypt.__init__
+        def _patched_init(self, secret_key) -> None:
+            _original_init(self, secret_key)
+            self._secret_key = bytes(secret_key)
+            self._incr_nonce = 0
+            logger.info(f"Crypt initialized with key length: {len(self._secret_key)}")
+        Crypt.__init__ = _patched_init
+
+        # 2. Define the new encryption method
+        def _encrypt_aead_xchacha20_poly1305_rtpsize(self, header: bytes, data) -> bytes:
+            nonce = bytearray(24)
+            nonce[:4] = struct.pack('>I', self._incr_nonce)
+            self._incr_nonce = (self._incr_nonce + 1) & 0xFFFFFFFF
+            
+            encrypted = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+                bytes(data), bytes(header), bytes(nonce), self._secret_key
+            )
+            return header + encrypted + nonce[:4]
+
+        # 3. Define the new decryption method with capture
+        def _decrypt_aead_xchacha20_poly1305_rtpsize(self, header: bytes, data) -> bytes:
+            global packet_captured
+            payload = data[:-4]
+            short_nonce = data[-4:]
+            
+            # Standard attempt
+            nonce = bytearray(24)
+            nonce[:4] = short_nonce
+            
+            try:
+                return nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    bytes(payload), bytes(header), bytes(nonce), self._secret_key
+                )
+            except Exception as e:
+                # Capture the first failed voice packet for analysis
+                if not packet_captured and len(payload) > 50:
+                    packet_captured = True
+                    try:
+                        with open("failed_packet.bin", "wb") as f:
+                            f.write(header + data)
+                        with open("failed_key.txt", "w") as f:
+                            f.write(self._secret_key.hex())
+                        logger.info("!!! CAPTURED FAILED PACKET AND KEY TO failed_packet.bin and failed_key.txt !!!")
+                    except Exception as capture_err:
+                        logger.error(f"Failed to capture packet: {capture_err}")
+                
+                # Re-throwing with the full error message for the user
+                raise RuntimeError(f"Decryption failed: {e}")
+
+        # 4. Patch Encryption.encrypt to handle the new mode
+        _original_encrypt = Encryption.encrypt
+        def _patched_encrypt(self, mode: str, header: bytes, data) -> bytes:
+            if mode == "aead_xchacha20_poly1305_rtpsize":
+                return _encrypt_aead_xchacha20_poly1305_rtpsize(self, header, data)
+            return _original_encrypt(self, mode, header, data)
+
+        # 5. Patch Decryption.decrypt to handle the new mode
+        _original_decrypt = Decryption.decrypt
+        def _patched_decrypt(self, mode: str, header: bytes, data) -> bytes:
+            if mode == "aead_xchacha20_poly1305_rtpsize":
+                return _decrypt_aead_xchacha20_poly1305_rtpsize(self, header, data)
+            return _original_decrypt(self, mode, header, data)
+
+        # Inject everything
+        Encryption.encrypt = _patched_encrypt
+        Decryption.decrypt = _patched_decrypt
+        
+        # Update supported modes
+        if "aead_xchacha20_poly1305_rtpsize" not in Encryption.SUPPORTED:
+            Encryption.SUPPORTED = ("aead_xchacha20_poly1305_rtpsize",) + Encryption.SUPPORTED
+            
+        logger.info("Successfully applied full AEAD monkey-patch with capture.")
+    except Exception as e:
+        logger.error(f"Failed to patch interactions.py: {e}")
+
+# ── Imports and setup ─────────────────────────────────────────────────────────
 from faster_whisper import WhisperModel
 from TTS.api import TTS
-from dotenv import load_dotenv, set_key, find_dotenv
-import aiohttp
-from aiohttp import ClientTimeout, ClientError
-from datetime import datetime
+from dotenv import load_dotenv, set_key
+import google.generativeai as genai
+import torch
+
+# Fix for PyTorch 2.6+ breaking TTS with weights_only=True default
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 # ── Logging configuration ─────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        RotatingFileHandler(
-            "bot_debug.log",
-            maxBytes=5*1024*1024,      # new log after 5MB
-            backupCount=5,             # store up to 5 log files
-            encoding="utf-8"
-        )
+        RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=5),
+        logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("DiscordBot")
 
-# ── Environment variables and constants ────────────────────────────────────────
-# Find .env & load
-dotenv_path = find_dotenv()
-load_dotenv(dotenv_path)
-TOKEN = os.getenv("DISCORD_TOKEN")
-LM_STUDIO_API_URL = os.getenv("LM_STUDIO_API_URL", "http://127.0.0.1:5000")
-ROLE = os.getenv("ROLE", "")
-KEYWORDS = [w.strip() for w in os.getenv("KEYWORDS", "").split(",") if w.strip()]
-LANGUAGE      = os.getenv("LANGUAGE", "en")
-GUILD_ID      = int(os.getenv("GUILD_ID", "0"))
+# Apply the patch immediately
+patch_interactions_voice()
 
-# TTS settings from .env
+# ── Load environment variables ────────────────────────────────────────────────
+load_dotenv()
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = os.getenv("GUILD_ID")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if DISCORD_TOKEN:
+    DISCORD_TOKEN = DISCORD_TOKEN.strip()
+
+if not DISCORD_TOKEN or not GUILD_ID:
+    logger.error("Missing DISCORD_TOKEN or GUILD_ID in .env")
+    exit(1)
+
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+else:
+    logger.warning("GOOGLE_API_KEY not found in environment variables.")
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+MODEL_SIZE = "base"
+LANGUAGE = "en"
+ROLE = "You are a helpful, witty, and friendly AI assistant named Saya. You are chatting with users in a Discord voice channel. Keep your responses concise and conversational."
+
+# TTS settings
 TTS_MODE = os.getenv("TTS_MODE", "default")
 CURRENT_SPEAKER_WAV = os.getenv("SELECTED_FILE_PATH", "./sample/sample_default.wav")
-
 AUDIO_DIR = Path(os.path.abspath("./audio"))
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
 
-# Compile regex for keywords
-pattern = (r"\b(?:" + "|".join(re.escape(w) for w in KEYWORDS) + r")\b") if KEYWORDS else None
-KEYWORD_RE = re.compile(pattern, flags=re.IGNORECASE) if pattern else None
+# Global state
+bot = Client(intents=Intents.ALL)
+stt_model = WhisperModel(MODEL_SIZE, device="cuda" if torch.cuda.is_available() else "cpu", compute_type="float16" if torch.cuda.is_available() else "int8")
+tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2").to("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Initializing Whisper and TTS ────────────────────────────────────────────────
-stt_model = WhisperModel(
-    model_size_or_path="large-v2",
-    device="cuda",
-    compute_type="int8"
-)
-tts = TTS(model_name="multilingual/multi-dataset/xtts_v2")
-tts.to("cuda")
-
-
-#
-# Helper for HTTP POST with timeout and retries
-#
-async def post_with_retries(url, json_payload, retries=3, backoff_factor=2):
-    """
-    Init POST `url` with `json_payload`,
-    timeout and retries handler
-    """
-    timeout = ClientTimeout(total=10)  # timeout 10s
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(1, retries + 1):
-            try:
-                async with session.post(url, json=json_payload) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-            except (ClientError, asyncio.TimeoutError) as e:
-                if attempt == retries:
-                    logger.error(f"LM API failed after {retries} attempts: {e}")
-                    return None
-                delay = backoff_factor ** (attempt - 1)
-                logger.warning(f"LM API error (attempt {attempt}/{retries}): {e}; retrying in {delay}s")
-                await asyncio.sleep(delay)
-
-
-# ── Main bot with voice recording ────────────────────────────────────────────────
-intents = Intents.ALL
-bot = interactions.Client(token=TOKEN, intents=intents)
-
-recording_lock = asyncio.Lock()
 is_connected = False
-is_playing_response = False
 current_channel = None
+recording_lock = asyncio.Lock()
+is_playing_response = False
 
-@bot.listen(Startup)
-async def on_startup():
-    global is_connected  # explicitly modify the global variable
-    is_connected = False  # reset connection state on startup
+# ── Bot Events ────────────────────────────────────────────────────────────────
 
-    guild = await bot.fetch_guild(GUILD_ID)
+@bot.listen(Ready)
+async def on_ready():
+    global is_connected, current_channel
+    is_connected = False
+    
+    logger.info(f"Bot is ready! Logged in as {bot.user.username}")
+    
+    # Wait for cache to populate and gateway to stabilize
+    logger.info("Waiting 10s for gateway to stabilize and cache to populate...")
+    await asyncio.sleep(10)
+
+    try:
+        logger.info(f"Fetching guild with ID: {GUILD_ID}")
+        guild = await bot.fetch_guild(GUILD_ID)
+    except Exception as e:
+        logger.error(f"Failed to fetch guild: {e}")
+        return
+
+    if not guild:
+        logger.error(f"Could not find guild with ID {GUILD_ID}.")
+        return
+
+    # Auto-connect logic
+    logger.info("Scanning channels for auto-connection...")
     all_states = guild.voice_states
-
-    # Find a channel with exactly one member
+    target_channel = None
+    
     for channel in guild.channels:
-        if channel.type is not interactions.ChannelType.GUILD_VOICE:
+        if channel.type != interactions.ChannelType.GUILD_VOICE:
             continue
-        members_states = [vs for vs in all_states if vs.channel and vs.channel.id == channel.id]
-        if len(members_states) == 1:  # Channel with one person
-            vs_state = members_states[0]
-            member = vs_state.member
-            nick = member.display_name
-            voice = await channel.connect()
-            logger.info(f"Auto-connecting to {nick} in channel {channel.name}")
-            prompt = f'Greet the user "{nick}" and introduce yourself as "Saya".'
-            async def post_with_retries(url, json_payload, retries=3, backoff_factor=2):
-                timeout = ClientTimeout(total=10)  # timeout 10s
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    for attempt in range(1, retries+1):
-                        try:
-                            async with session.post(url, json=json_payload) as resp:
-                                resp.raise_for_status()
-                                return await resp.json()
-                        except (ClientError, asyncio.TimeoutError) as e:
-                            if attempt == retries:
-                                logger.error(f"LM API failed after {retries} tries: {e}")
-                                return None
-                            sleep = backoff_factor ** (attempt - 1)
-                            logger.warning(f"LM API error (attempt {attempt}/{retries}): {e}, retrying in {sleep}s")
-                            await asyncio.sleep(sleep)
+            
+        # Filter voice states for this channel
+        members_in_channel = [vs for vs in all_states if vs.channel and vs.channel.id == channel.id]
+        logger.info(f"Channel '{channel.name}' (ID: {channel.id}) has {len(members_in_channel)} members.")
         
-            payload = {
-                "model": "your-model-id",
-                "messages": [{"role": "system", "content": ROLE}, {"role": "user", "content": prompt}],
-                "max_tokens": 350
-            }
-            data = await post_with_retries(f"{LM_STUDIO_API_URL}/v1/chat/completions", payload)
-            if not data:
-                greeting = "No answer from LLM server."
-            else:
-                greeting = data["choices"][0]["message"]["content"]
-            ts = datetime.now().strftime("%Y%m%d%H%M%S")
-            out_path = AUDIO_DIR / f"greet_{ts}.wav"
-            await asyncio.to_thread(
-                tts.tts_to_file,
-                text=greeting,
-                speaker="Ana Florence",
-                language=LANGUAGE,
-                file_path=str(out_path)
-            )
-            await voice.play(AudioVolume(str(out_path)))
-            await asyncio.sleep(2)
-            await voice.play(AudioVolume("join.wav"))
-            asyncio.create_task(start_recording(voice, str(AUDIO_DIR)))
+        if len(members_in_channel) == 1:
+            target_channel = channel
+            logger.info(f"Found suitable channel: {channel.name}")
             break
+    
+    if target_channel:
+        try:
+            logger.info(f"Attempting to auto-connect to channel: {target_channel.name}")
+            voice = await target_channel.connect()
+            is_connected = True
+            current_channel = target_channel
+            logger.info("Successfully connected to voice.")
+            
+            # Voice recording is now enabled - encryption issues have been fixed
+            asyncio.create_task(start_recording(voice, str(AUDIO_DIR)))
+            
+        except Exception as e:
+            logger.error(f"Failed to auto-connect: {e}")
     else:
-        # If no single-person channel is found, search for a channel with multiple people
-        for channel in guild.channels:
-            if channel.type is not interactions.ChannelType.GUILD_VOICE:
-                continue
-            members_states = [vs for vs in all_states if vs.channel and vs.channel.id == channel.id]
-            if len(members_states) > 1:  # Channel with multiple people
-                voice = await channel.connect()
-                logger.info(f"Auto-connecting to channel {channel.name} with multiple people.")
-                await asyncio.sleep(2)  # Wait briefly before starting to listen
-                await voice.play(AudioVolume("join.wav"))
-                asyncio.create_task(start_recording(voice, str(AUDIO_DIR)))
-                break
-
-    logger.info("Bot is now waiting for keywords.")
+        logger.info("No suitable channel found for auto-connection (need exactly 1 person in a channel).")
 
 async def reconnect_voice(channel):
     try:
         if channel:
+            logger.info(f"Attempting to reconnect to {channel.name}...")
             return await channel.connect()
         logger.error("Channel not found for reconnect.")
     except Exception as e:
@@ -197,28 +256,48 @@ async def reconnect_voice(channel):
     return None
 
 async def start_recording(voice_state, output_dir: str):
-    global current_channel
-    if not voice_state:
-        voice_state = await reconnect_voice(current_channel) if current_channel else None
-        if not voice_state:
-            logger.error("Failed to restore connection.")
-            return
-    async with recording_lock:
-        await voice_state.start_recording(output_dir=output_dir, encoding="wav")
-    await asyncio.sleep(3)
-    await stop_recording(voice_state)
+    global current_channel, is_playing_response
+    
+    if hasattr(start_recording, "_is_running") and start_recording._is_running:
+        return
+    start_recording._is_running = True
 
-    for user_id, file in list(voice_state.recorder.output.items()):
-        audio_path = file.get("path") if isinstance(file, dict) else file
-        if os.path.exists(audio_path):
-            await process_audio_for_user(voice_state, user_id, audio_path)
+    try:
+        while is_connected:
+            if not voice_state or not voice_state.ws or not voice_state.ws.socket:
+                voice_state = await reconnect_voice(current_channel) if current_channel else None
+                if not voice_state:
+                    logger.error("Failed to restore connection. Retrying in 5s...")
+                    await asyncio.sleep(5)
+                    continue
 
-    if not is_playing_response:
-        await start_recording(voice_state, output_dir)
+            if is_playing_response:
+                await asyncio.sleep(1)
+                continue
 
-async def stop_recording(voice_state):
-    async with recording_lock:
-        await voice_state.stop_recording()
+            try:
+                async with recording_lock:
+                    logger.debug("Starting recording cycle...")
+                    await voice_state.start_recording(output_dir=output_dir, encoding="wav")
+                    await asyncio.sleep(3)
+                    await voice_state.stop_recording()
+                    logger.debug("Stopped recording cycle.")
+
+                recordings = list(voice_state.recorder.output.items())
+                for user_id, file in recordings:
+                    audio_path = file.get("path") if isinstance(file, dict) else file
+                    if audio_path and os.path.exists(audio_path):
+                        asyncio.create_task(process_audio_for_user(voice_state, user_id, audio_path))
+
+            except Exception as e:
+                logger.error(f"Error in recording cycle: {e}")
+                await asyncio.sleep(1)
+            
+            await asyncio.sleep(0.5)
+
+    finally:
+        start_recording._is_running = False
+        logger.info("Recording loop exited.")
 
 async def transcribe_audio(audio_path: str) -> str:
     def _transcribe_blocking(path):
@@ -228,7 +307,6 @@ async def transcribe_audio(audio_path: str) -> str:
     try:
         segments, info = await asyncio.to_thread(_transcribe_blocking, audio_path)
         texts = [seg.text for seg in segments if hasattr(seg, 'text')]
-        logger.debug(f"Detected language '{info.language}' (p={info.language_probability:.2f})")
         return " ".join(texts)
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
@@ -237,187 +315,115 @@ async def transcribe_audio(audio_path: str) -> str:
 async def process_audio_for_user(voice_state, user_id: int, audio_path: str):
     global is_playing_response
     full_text = await transcribe_audio(audio_path)
-    logger.debug(f"Text: {full_text}")
-    if KEYWORD_RE and KEYWORD_RE.search(full_text):
-        is_playing_response = True
-        await voice_state.play(AudioVolume("trigger.wav"))
-        await process_audio_for_individual_user(
-            voice_state,
-            user_id,
-            full_text,
-            speaker_wav=CURRENT_SPEAKER_WAV
-        )
-
-async def process_audio_for_individual_user(voice_state, user_id, initial_text, speaker_wav: str):
-    global is_playing_response, current_channel
-    # Clear old recordings
-    for old in AUDIO_DIR.rglob("*.wav"):
-        old.unlink()
-    voice_state.recorder.output.clear()
-
-    now = datetime.now().strftime("%Y%m%d%H%M%S")
-    user_dir = AUDIO_DIR / f"individual_{user_id}_{now}"
-    user_dir.mkdir(parents=True, exist_ok=True)
-
-    await voice_state.start_recording(output_dir=str(user_dir), encoding="wav")
-    await asyncio.sleep(10)
-    await stop_recording(voice_state)
-
-    if not voice_state:
-        voice_state = await reconnect_voice(current_channel) if current_channel else None
-        if not voice_state:
-            logger.error("Failed to restore connection.")
-            return
-
-    await voice_state.play(AudioVolume("listening.wav"))
-    data = voice_state.recorder.output.get(user_id)
-    audio_path = data.get("path") if isinstance(data, dict) else data
-    if not audio_path or not os.path.exists(audio_path):
-        logger.error(f"Audio file does not exist: {audio_path}")
+    if not full_text.strip():
         return
 
-    followup = await transcribe_audio(audio_path)
-    full_text = f"{initial_text} {followup}".strip()
-    logger.debug(f"Text: {followup}")
+    logger.info(f"User said: {full_text}")
+    is_playing_response = True
+    
+    try:
+        await voice_state.play(AudioVolume("trigger.wav"))
+    except:
+        pass
 
     if TTS_MODE == "default":
         await generate_and_play_response(voice_state, user_id, full_text)
     else:
-        await generate_and_play_voiceclone_response(
-            voice_state, user_id, full_text, speaker_wav
-        )
+        await generate_and_play_voiceclone_response(voice_state, user_id, full_text, CURRENT_SPEAKER_WAV)
+
+async def generate_gemini_response(text: str) -> str:
+    # LOCKED to the only working model for this account
+    model_name = 'models/gemini-3-flash-preview'
+    
+    try:
+        logger.info(f"Generating response with model: {model_name}")
+        model = genai.GenerativeModel(model_name)
+        full_prompt = f"System Role: {ROLE}\n\nUser: {text}"
+        response = await asyncio.to_thread(model.generate_content, full_prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return "I'm sorry, I encountered an error while thinking."
 
 async def generate_and_play_response(voice_state, user_id, text: str):
-    """
-    Pipeline TTS responses one sentence at a time to avoid GPU overload.
-    """
     global is_playing_response
-    # 1) Get LLM answer with timeout & retries
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    payload = {
-        "model": "your-model-id",
-        "messages": [{"role": "system", "content": ROLE}, {"role": "user", "content": text}],
-        "max_tokens": 1000
-    }
-    data = await post_with_retries(f"{LM_STUDIO_API_URL}/v1/chat/completions", payload)
-    if not data:
-        answer = "No answer from LLM server"
-    else:
-        answer = data["choices"][0]["message"]["content"]
+    answer = await generate_gemini_response(text)
+    logger.info(f"Gemini reply: {answer}")
 
-    # 2) Split into sentences
     sentences = re.split(r'(?<=[\.!\?])\s+', answer.strip())
     if not sentences:
+        is_playing_response = False
         return
 
-    # Helper: run TTS for one sentence
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+
     def tts_to_file(sentence, idx):
         out = AUDIO_DIR / f"response_{ts}_{idx}.wav"
-        tts.tts_to_file(
-            text=sentence,
-            speaker="Ana Florence",
-            language=LANGUAGE,
-            file_path=str(out)
-        )
+        tts.tts_to_file(text=sentence, speaker="Ana Florence", language=LANGUAGE, file_path=str(out))
         return str(out)
 
     is_playing_response = True
-
-    # 3) Generate and play first sentence synchronously
-    first_wav = await asyncio.to_thread(tts_to_file, sentences[0], 0)
-    play_task = asyncio.create_task(voice_state.play(AudioVolume(first_wav)))
-
-    # 4) Now pipeline each remaining sentence one by one
-    for idx, sent in enumerate(sentences[1:], start=1):
-        # While the previous is still playing, generate this one on the side
-        next_wav = await asyncio.to_thread(tts_to_file, sent, idx)
-
-        # Wait for the previous playback to finish
+    try:
+        first_wav = await asyncio.to_thread(tts_to_file, sentences[0], 0)
+        play_task = asyncio.create_task(voice_state.play(AudioVolume(first_wav)))
+        for idx, sent in enumerate(sentences[1:], start=1):
+            next_wav = await asyncio.to_thread(tts_to_file, sent, idx)
+            await play_task
+            play_task = asyncio.create_task(voice_state.play(AudioVolume(next_wav)))
         await play_task
-
-        # Play this sentence, then loop to generate+queue the next
-        play_task = asyncio.create_task(voice_state.play(AudioVolume(next_wav)))
-
-    # 5) Wait for the final sentence to finish
-    await play_task
-    is_playing_response = False
+    except Exception as e:
+        logger.error(f"Error in TTS playback: {e}")
+    finally:
+        is_playing_response = False
 
 async def generate_and_play_voiceclone_response(voice_state, user_id, text: str, speaker_wav: str):
-    """
-    Pipeline TTS-clone responses one sentence at a time to avoid GPU overload.
-    """
     global is_playing_response
-    # 1) Get LLM answer with timeout & retries
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    payload = {
-        "model": "your-model-id",
-        "messages": [{"role": "system", "content": ROLE}, {"role": "user", "content": text}],
-        "max_tokens": 1000
-    }
-    data = await post_with_retries(f"{LM_STUDIO_API_URL}/v1/chat/completions", payload)
-    if not data:
-        answer = "No answer from LLM server."
-    else:
-        answer = data["choices"][0]["message"]["content"]
+    answer = await generate_gemini_response(text)
+    logger.info(f"Gemini reply: {answer}")
 
-    # 2) Split into sentences
     sentences = re.split(r'(?<=[\.!\?])\s+', answer.strip())
     if not sentences:
+        is_playing_response = False
         return
 
-    # Helper: run TTS-clone for one sentence
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+
     def tts_clone_to_file(sentence, idx):
         out = AUDIO_DIR / f"clone_{ts}_{idx}.wav"
-        tts.tts_to_file(
-            text=sentence,
-            speaker_wav=speaker_wav,
-            language=LANGUAGE,
-            file_path=str(out)
-        )
+        tts.tts_to_file(text=sentence, speaker_wav=speaker_wav, language=LANGUAGE, file_path=str(out))
         return str(out)
 
     is_playing_response = True
-
-    # 3) Generate and play first sentence synchronously
-    first_wav = await asyncio.to_thread(tts_clone_to_file, sentences[0], 0)
-    play_task = asyncio.create_task(voice_state.play(AudioVolume(first_wav)))
-
-    # 4) Now pipeline each remaining sentence one by one
-    for idx, sent in enumerate(sentences[1:], start=1):
-        # While the previous is still playing, generate this one on the side
-        next_wav = await asyncio.to_thread(tts_clone_to_file, sent, idx)
-
-        # Wait for the previous playback to finish
+    try:
+        first_wav = await asyncio.to_thread(tts_clone_to_file, sentences[0], 0)
+        play_task = asyncio.create_task(voice_state.play(AudioVolume(first_wav)))
+        for idx, sent in enumerate(sentences[1:], start=1):
+            next_wav = await asyncio.to_thread(tts_clone_to_file, sent, idx)
+            await play_task
+            play_task = asyncio.create_task(voice_state.play(AudioVolume(next_wav)))
         await play_task
+    except Exception as e:
+        logger.error(f"Error in TTS playback: {e}")
+    finally:
+        is_playing_response = False
 
-        # Play this sentence, then loop to generate+queue the next
-        play_task = asyncio.create_task(voice_state.play(AudioVolume(next_wav)))
-
-    # 5) Wait for the final sentence to finish
-    await play_task
-    is_playing_response = False
-
-# ── Slash commands ─────────────────────────────────────────────────────────────
-@slash_command(
-    name="join",
-    description="Connect to a voice channel."
-)
+@slash_command(name="join", description="Connect to a voice channel.")
 async def join(ctx: SlashContext):
     global is_connected, current_channel
     if is_connected:
         return await ctx.send("I'm already connected.")
     if not ctx.author.voice:
         return await ctx.send("❗ Please join a voice channel and try again.")
+
     vs = await ctx.author.voice.channel.connect()
     is_connected = True
     current_channel = ctx.author.voice.channel
     await ctx.send("✅ Connected.")
+    # Recording is now enabled - encryption issues have been fixed
     asyncio.create_task(start_recording(vs, str(AUDIO_DIR)))
 
-@slash_command(
-    name="leave",
-    description="Disconnect from the voice channel."
-)
+
+@slash_command(name="leave", description="Disconnect from the voice channel.")
 async def leave(ctx: SlashContext):
     global is_connected, current_channel
     if ctx.voice_state:
@@ -447,118 +453,13 @@ async def leave(ctx: SlashContext):
 async def saya_tts(ctx: SlashContext, mode: str):
     global TTS_MODE
     if mode not in ("default", "clone"):
-        return await ctx.send("❗ Invalid mode, choose 'default' or 'clone'.", ephemeral=True)
+        return await ctx.send("❗ Invalid mode.", ephemeral=True)
     TTS_MODE = mode
-    # Persist to .env
-    set_key(dotenv_path, "TTS_MODE", mode)
+    set_key(".env", "TTS_MODE", mode)
     await ctx.send(f"✅ TTS mode set to: `{mode}`")
 
-# ── Pagination for file list ─────────────────────────────────────────────────
-def generate_file_list_page(files, page=1, items_per_page=5):
-    start_idx = (page - 1) * items_per_page
-    end_idx = page * items_per_page
-    selected_files = files[start_idx:end_idx]
-
-    embed = Embed(
-        title="List of available sample files",
-        description="Click the button with the file number to select."
-    )
-    for idx, fname in enumerate(selected_files, start=start_idx + 1):
-        embed.add_field(name=f"{idx}. {fname}", value=fname, inline=False)
-
-    # navigation buttons (at most 2)
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(Button(label="« Back", custom_id="prev_page", style=ButtonStyle.SECONDARY))
-    if end_idx < len(files):
-        nav_buttons.append(Button(label="Next »", custom_id="next_page", style=ButtonStyle.SECONDARY))
-
-    # selection buttons (up to items_per_page, i.e. ≤5)
-    select_buttons = [
-        Button(label=str(idx), custom_id=f"select_{fname}", style=ButtonStyle.PRIMARY)
-        for idx, fname in enumerate(selected_files, start=start_idx + 1)
-    ]
-
-    # wrap into ActionRows (each row ≤5 components)
-    rows = []
-    if select_buttons:
-        rows.append(ActionRow(*select_buttons))
-    if nav_buttons:
-        rows.append(ActionRow(*nav_buttons))
-
-    return embed, rows
-    
-@slash_command(name="saya_list", description="Show the list of files and select one.")
-async def saya_list(ctx: SlashContext):
-    global CURRENT_SPEAKER_WAV
-    sample_files = [f.name for f in Path("./sample").glob("*.wav")]
-    if not sample_files:
-        return await ctx.send("❗ No `.wav` files found in the `./sample` folder.")
-
-    page = 1
-    embed, components = generate_file_list_page(sample_files, page)
-    await ctx.send(embed=embed, components=components, ephemeral=True)
-
-    try:
-        while True:
-            used = await bot.wait_for_component(
-                components=components,
-                check=lambda c: c.ctx.author.id == ctx.author.id,
-                timeout=60
-            )
-            cid = used.ctx.custom_id
-            if cid in ("prev_page", "next_page"):
-                page += -1 if cid == "prev_page" else 1
-            elif cid.startswith("select_"):
-                fname = cid.split("_", 1)[1]
-                CURRENT_SPEAKER_WAV = f"./sample/{fname}"
-                # Persist to .env
-                set_key(dotenv_path, "SELECTED_FILE_PATH", CURRENT_SPEAKER_WAV)
-                await used.ctx.edit_origin(
-                    embed=Embed(
-                        title="Done! 🎉",
-                        description=f"Selected file for cloning: `{fname}`"
-                    ),
-                    components=[]
-                )
-                return await used.ctx.send("Configuration saved ✅", ephemeral=True)
-            embed, components = generate_file_list_page(sample_files, page)
-            await used.ctx.edit_origin(embed=embed, components=components)
-    except asyncio.TimeoutError:
-        # Cleanup ephemeral menu on timeout
-        await ctx.edit(components=[])
-
-# ── upload custom WAV ───────────────────────────────────────────
-@slash_command(
-    name="upload_wav",
-    description="Upload your own .wav file for cloning",
-    options=[
-        SlashCommandOption(
-            name="file",
-            description="Your .wav file",
-            type=OptionType.ATTACHMENT,
-            required=True
-        )
-    ]
-)
-async def upload_wav(ctx: SlashContext, file):
-    # Validate extension
-    if not file.filename.lower().endswith(".wav"):
-        return await ctx.send("❗ Please upload a .wav file.", ephemeral=True)
-
-    # Download the file into ./sample
-    dest = Path("./sample") / file.filename
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(file.url) as resp:
-            if resp.status != 200:
-                return await ctx.send("❗ Failed to download the file. Please try again.", ephemeral=True)
-            data = await resp.read()
-    dest.write_bytes(data)
-
-    await ctx.send(
-        f"✅ File `{file.filename}` successfully uploaded to `./sample`.\n"
-        "You can now select it via `/saya_list`.",
-        ephemeral=True
-    )
-
-bot.start()
+try:
+    bot.start(DISCORD_TOKEN)
+except Exception as e:
+    logger.error(f"Bot failed to start: {e}")
+    raise
