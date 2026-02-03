@@ -8,9 +8,9 @@
 - Issue: `.env` file contains plaintext Discord bot token and Google API key
 - Files: `C:/Users/patri/Documents/Repositories/Discord-Local-LLM-VoiceChat-Bot/.env`
 - Current state:
-  - DISCORD_TOKEN=[REDACTED] (exposed)
-  - GOOGLE_API_KEY=[REDACTED] (exposed)
-  - GUILD_ID=[REDACTED] (exposed)
+  - DISCORD_TOKEN=[REDACTED - stored in .env]
+  - GOOGLE_API_KEY=[REDACTED - stored in .env]
+  - GUILD_ID=[REDACTED - stored in .env]
 - Impact: Discord bot can be hijacked, Google API can be abused for expensive operations, attackers can target the specific guild
 - Recommendation: Immediately rotate all tokens/keys. Add `.env` to `.gitignore` (it appears to be tracked in git). Use environment variable defaults with clear documentation
 
